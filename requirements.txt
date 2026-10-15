@@ -1,0 +1,4 @@
+python-socketio>=5.11
+requests>=2.32
+# optional (screenshot demo on GUI VMs):
+mss>=9.0

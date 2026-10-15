@@ -1,0 +1,17 @@
+{
+  "name": "cipher-c2-lab",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Isolated classroom lab: C2 demo for malware detection exercises",
+  "main": "c2_server.js",
+  "scripts": {
+    "server": "node c2_server.js",
+    "client:js": "node rat_virus.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1"
+  }
+}
