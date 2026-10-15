@@ -1,18 +1,15 @@
-# RAT Backend Server
-from flask import Flask, jsonify
-import subprocess
-
-app = Flask(__name__)
-
-@app.route('/start_keylogger')
-def start_keylogger():
-    subprocess.Popen(["C:\\Users\\Memen\\AppData\\Local\\Programs\\Python\\Launcher\\py.exe", "-m", "http.server", "8000"])
-    return jsonify({"status": "Keylogger started"})
-
-@app.route('/stop_keylogger')
-def stop_keylogger():
-    subprocess.run(["taskkill", "/F", "/IM", "http.server"])
-    return jsonify({"status": "Keylogger stopped"})
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+# server.py — REMOVED (fix #6)
+#
+# The original Flask stub was broken and dead:
+#   * hardcoded interpreter path from a personal machine
+#     (C:\Users\Memen\...\py.exe)
+#   * "start keylogger" actually launched `python -m http.server`
+#     (not a keylogger at all)
+#   * `taskkill /IM http.server` is invalid syntax for what it spawned
+#   * nothing in the project talked to port 5000; its routes duplicated
+#     endpoints that now live properly in c2_server.js
+#
+# All of its intended functionality (health, client list, command relay,
+# keylogger toggle) is implemented against the real Socket.IO C2 in
+# c2_server.js + index.html. This file is intentionally left empty so the
+# repo history shows the deletion decision. See PROTOCOL.md for the API.

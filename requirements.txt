@@ -1,6 +1,4 @@
-pyinstaller==6.11.1
-python-socketio==5.9.0
-mss==6.1.0
-keyboard==0.13.5
-psutil==5.9.8
-pillow==9.5.0
+python-socketio>=5.11
+requests>=2.32
+# optional (screenshot demo on GUI VMs):
+mss>=9.0

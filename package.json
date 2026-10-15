@@ -1,18 +1,17 @@
 {
-  "name": "rat-app",
-  "version": "1.0.0",
-  "description": "Remote Administration Tool",
+  "name": "cipher-c2-lab",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Isolated classroom lab: C2 demo for malware detection exercises",
   "main": "c2_server.js",
   "scripts": {
-    "start": "node c2_server.js",
-    "client": "node rat_virus.js",
-    "install-all": "npm install && node c2_server.js"
+    "server": "node c2_server.js",
+    "client:js": "node rat_virus.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "multer": "^2.4.0",
-    "socket.io": "^4.7.2",
-    "socket.io-client": "^4.8.4"
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1"
   }
 }

